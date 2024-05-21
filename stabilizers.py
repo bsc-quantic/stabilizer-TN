@@ -5,7 +5,7 @@ from qiskit.quantum_info import Clifford
 from qiskit.quantum_info.operators.symplectic.clifford_circuits import *
 from qiskit.circuit import Barrier, Delay, Gate, Instruction
 from qiskit.circuit.exceptions import CircuitError
-from qiskit.providers.fake_provider import FakeWashingtonV2
+from qiskit.providers.fake_provider import FakeWashingtonV2 # GenericBackendV2(127)
 
 import numpy as np
 from random import random
@@ -41,7 +41,7 @@ Sdg = qu.S_gate().conj()
 def connectivity_kyiv():
     # Uses fake chip Washington and adds two missing connections to get 
     # the connectivity of the IBM 127qb-chip experiment
-    fake = FakeWashingtonV2()
+    fake = FakeWashingtonV2() # GenericBackendV2(127)
     cx_instructions = []
     for instruction in fake.instructions:
         if instruction[0].name == 'cx':
@@ -401,8 +401,30 @@ def tgate_decomp(tableau,qubit,dag=False):
 
     return gate_coefs, destab_list, stab_list
 
+def ccz_decomp(tableau,qubits):
+    # double check if its x1x2x3z1z2z3 (current) or x1z1x2z2x3z3
+    gate_list = [[0,0,0,0,0,0],[0,0,0,1,0,0],[0,0,0,0,1,0],[0,0,0,0,0,1],[0,0,0,1,1,0],[0,0,0,1,0,1],[0,0,0,0,1,1],[0,0,0,1,1,1]]
+    # General coefficients fixing the phase of Id to 1
+    gate_coefs = [3/4,1/4,1/4,1/4,-1/4,-1/4,-1/4,1/4]
 
+    final_coefs = []
+    destab_list = []
+    stab_list = []
+    tot_qubits = len(tableau)//2
 
+    for i,gate in enumerate(gate_list):
+        gate_vector = [0,]*(len(tableau))
+        for i,qubit in enumerate(qubits):
+            gate_vector[qubits] = gate[i]
+            gate_vector[qubit+tot_qubits] = gate[i+3]
+
+        phase, destab, stab = gate_decomposition(tableau,gate_vector,qubits)
+
+        final_coefs.append(gate_coefs[i]*phase)
+        destab_list.append(destab)
+        stab_list.append(stab)
+
+    return final_coefs, destab_list, stab_list
 
 def ugate_decomp(tableau,qubit,theta,phi,lambd):
     # decomposes a generic ugate into boolean pauli form 
@@ -424,7 +446,7 @@ def ugate_decomp(tableau,qubit,theta,phi,lambd):
     tot_qubits = len(tableau)//2
 
     for i,gate in enumerate(gate_list):
-        if gate_coefs[i] == 0: 
+        if np.abs(gate_coefs[i]) <= 1e-10: 
             continue
         gate_vector = [0,]*(len(tableau))
         gate_vector[qubit] = gate[0]
@@ -482,7 +504,7 @@ def cc_gate(qubits,inds,type='x'):
 class gen_clifford(Clifford):
     # To make it easy we only initialize with clifford circuits so we can keep the init
 
-    def __init__(self, data, copy=True, mode='sparse_comp', max_bond=None, debug=False, *args, **kwargs):
+    def __init__(self, data, copy=True, mode='sparse_comp', max_bond=None, cc_direct=False, contract=False, debug=False, *args, **kwargs):
         super(gen_clifford, self).__init__(data, copy=True, *args, **kwargs)
 
         if isinstance(data, gen_clifford) and copy:
@@ -491,7 +513,10 @@ class gen_clifford(Clifford):
             self._results = data._results
             self._num_clbits = data.num_qubits
             self._max_bond = data.max_bond
-            self._debug = debug
+            self._debug = data._debug
+            self.cc_direct = data.cc_direct   # Try implementation of cc gate directly
+            self._contract = data._contract
+
             return 
 
         # initalize bond_matrix if it's not a copy
@@ -516,6 +541,10 @@ class gen_clifford(Clifford):
         self._results = {}
         self._max_bond = max_bond # this is useless if mode != 'tn' but it's easier to have the parameter
         self._debug = debug
+        self.cc_direct = cc_direct 
+        if contract:
+            contract = 'swap+split'
+        self._contract = contract
 
     @property
     def xvec(self):
@@ -550,12 +579,21 @@ class gen_clifford(Clifford):
             max_bond = self.max_bond
         
         if self._mode=='tn':
-            self._xvec.compress(max_bond=max_bond)
+            if self._contract==False:
+                self._xvec.contract(...,max_bond=self.max_bond)
+            else:
+                self._xvec.compress(max_bond=max_bond)
         else:
             print(f"Mode {self._mode} does not use bond dimension")
             
         return
     
+
+    def to_pure_mps(self):
+        # This converts to computational basis (traditional MPS) in a sort of optimal way.
+        # to_quimb_circuit uses qiskit's to_circuit to extract a Clifford circuit from the current tableau (optimal in depth)
+        # Then it can apply this circuit on to the MPS in tensor network form by choosing on_mps=True
+        return self.to_quimb_circuit(on_mps=True).contract(...,max_bond=self.max_bond)
 
 
     def computational_basis(self,tol=1e-10j):
@@ -599,8 +637,11 @@ class gen_clifford(Clifford):
         return comp_vec.reshape([2,]*qubits)
     
 
-    def to_quimb_circuit(self):
-        quimb_c = qu.tensor.Circuit(self.num_qubits)
+    def to_quimb_circuit(self,on_mps=False):
+        if on_mps:
+            quimb_c = qu.tensor.Circuit(self.num_qubits,self.xvec)
+        else:
+            quimb_c = qu.tensor.Circuit(self.num_qubits)
         qiskit_c = self.to_circuit()
         for gt in qiskit_c:
             quimb_c.apply_gate(gt.operation.name, *[qiskit_c.find_bit(qb).index for qb in gt.qubits])
@@ -637,6 +678,17 @@ class gen_clifford(Clifford):
             observable = trans_pauli_rev(observable)
 
         self.measure(observable_v,observable,qubits)
+
+        return self._results
+    
+    def project_obs(self, observable, qubits=None):
+        if type(observable) is str:
+            observable_v = trans_pauli(observable)
+        else:
+            observable_v = observable
+            observable = trans_pauli_rev(observable)
+
+        self.measure(observable_v,observable,qubits,project=True)
 
         return self._results
 
@@ -694,34 +746,77 @@ class gen_clifford(Clifford):
     # for coef,destab,stab in zip(gate_coefs,destab_list,stab_list):
     #     print(f"coeff: {coef}, operator: {self.read_tableau_obs(destab,stab)}")
 
+    def apply_xvec_rot(self,angle,ind_dict,contract=False):
+        # For a given d we need to implement a R[(X/Y/Z)_i] for all qubits i involved in d and s
+        # This is done with a cascade of CNOTS, an RX and extra 1qb transf [arxiv/2305.04807]
+        if contract: contract='swap+split'
+        diff_inds = [ind for ind in ind_dict]
+
+        rot_ind = int(len(diff_inds)/2)
+        rot_qubit = diff_inds[rot_ind]
+
+        for j in ind_dict:
+            if ind_dict[j]=='Y':
+                self._xvec.gate_(S,j, contract=True)
+            elif ind_dict[j]=='Z':
+                self._xvec.gate_(H,j, contract=True)
+
+        prev_ind = diff_inds[0]
+        for j in diff_inds[1:rot_ind+1]:
+            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract)
+            prev_ind = j
+        prev_ind = diff_inds[-1]
+        for j in diff_inds[-2:rot_ind-1:-1]:
+            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract)
+            prev_ind = j
+
+        self._xvec.gate_(RX(2*angle), (rot_qubit), contract=True)
+
+        prev_ind = rot_qubit
+        for j in diff_inds[rot_ind-1::-1]:
+            if rot_ind == 0:
+                continue
+            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract)
+            prev_ind = j
+        prev_ind = rot_qubit
+        for j in diff_inds[rot_ind+1:]:
+            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract)
+            prev_ind = j
+
+        for j in ind_dict:
+            if ind_dict[j]=='Y':
+                self._xvec.gate_(Sdg,j, contract=True)
+            elif ind_dict[j]=='Z':
+                self._xvec.gate_(H,j, contract=True)
+
+
     def update_xvec(self,coefs,destab_list,stab_list,tolerance=1e-10):
         # Main method to update xvec. Different applications depending on the format of the vector
         mode = self.mode
+        contract = self._contract
 
         if mode == 'tn':
             params_sort = sorted(zip(coefs,destab_list,stab_list), key=lambda ins: sum(ins[1])) # [ordered array of (coef,destab,stab)]
-
             destab_ref = params_sort[0][1]
             for i,entry in enumerate(destab_ref):
-                if entry: self._xvec.gate_(X,i,contract='swap+split') # apply gates to qubits where the first destabilizer is not 0s
-            stab_ref = params_sort[0][1]
+                if entry: self._xvec.gate_(X,i,contract=True) # ,contract='swap+split' # apply gates to qubits where the first destabilizer is not 0s
+            stab_ref = params_sort[0][2]
             for i,entry in enumerate(stab_ref):
-                if entry: self._xvec.gate_(Z,i,contract='swap+split') # apply gates to qubits where the first stabilizer is not 0s    
-            coefs_trig = [np.arccos(params_sort[0][0])]
-
-            for i,(co,d,s) in enumerate(params_sort[1:]):
-                # For a given d we need to implement a R[(X/Y/Z)_i] for all qubits i involved in d and s
-                # This is done with a cascade of CNOTS, an RX and extra 1qb transf [https://arxiv.org/pdf/2305.04807.pdf]
-                if np.abs(co)<tolerance:
-                    continue
-
+                if entry: self._xvec.gate_(Z,i,contract=True) # ,contract='swap+split' # apply gates to qubits where the first stabilizer is not 0s    
+            total_coef = params_sort[0][0]
+            angles = []
+            ind_dicts = []
+            if len(params_sort) > 2:
+                print(f"applying decomposition with {len(params_sort)} terms")
+            for (co,d,s) in params_sort[1:]:
+                # Prepare the angles and the axes for the proper rotations based on the decomposition into stabs/destabs
                 d_differential = [(destab_ref[i]+dest)%2 for i,dest in enumerate(d)] 
                 s_differential = [(stab_ref[i]+st)%2 for i,st in enumerate(s)] 
-                extra_sign = (-1)**(sum(np.array(stab_ref)*np.array(d))) ####### added this missing (I think) sign that must be used below (TO DO) ########
+                extra_sign = (-1)**(sum(np.array(stab_ref)*np.array(d)))
 
                 ind_dict = {}
                 Ys = 0        
-                for j in range(len(d)):
+                for j in range(len(d_differential)):
                     if d_differential[j]:
                         if s_differential[j]:
                             ind_dict[j] = 'Y'
@@ -731,69 +826,32 @@ class gen_clifford(Clifford):
                     elif s_differential[j]:
                         ind_dict[j] = 'Z'
 
-                diff_inds = [ind for ind in ind_dict]
+                ind_dicts.append(ind_dict)
 
-                rot_ind = int(len(diff_inds)/2)
-                rot_qubit = diff_inds[rot_ind]
-
-                for theta in coefs_trig:
-                    co /= np.sin(theta)
-                    co *= np.conj((-1j)**Ys) * 1j # extract -1js from Ys in exponential and -1j from rotation
+                total_coef = np.sqrt(total_coef**2 + np.abs(co)**2)
+                co *= np.conj((-1j)**Ys) * 1j # extract -1js from Ys in exponential and -1j from rotation
                 phase = co/np.abs(co) # this should have the correct sign after extracting 1j components
-                coefs_trig[-1] *= phase # if phase is -1 it will be there automatically next iteration
 
-                # sanity checks ############## ALL THESE SHOULD BE CONVERTED TO RAISED ERRORS ##############
+                # sanity checks ########### ALL THESE SHOULD BE CONVERTED TO RAISED ERRORS ###########
                 # 1 : Coefficients bigger than 1
                 if (np.abs(co)-1)>1e-8: 
                     print('Found coefficient bigger than 1 by more than 1e-8. Unlikely to be numerical: recheck calculation.')
                 elif (np.abs(co)-1)>0:
                     co = np.sign(co)*1
-                # 2 : at the end of the string of coefficients we should be left with 1
-                if i==len(params_sort)-1: # 
-                    if np.abs(np.abs(co)-1)>1e-8: print('Something went wrong with the last angle')
-                # 3 : after extracting all the 1j factors phase can only be 1 or -1
-                if np.imag(phase)!=0 : print(f"Something went wrong with the angles! Phase is {phase}")          
+                # 2 : after extracting all the 1j factors phase can only be 1 or -1
+                if np.imag(phase)!=0 : print(f"Something went wrong with the angles! Phase is {phase}")        
 
-                angle = extra_sign*coefs_trig[-1]
-                coefs_trig.append(np.arccos(np.abs(co))) # we remove the phase because it's counted in the previous angle
+                angles.append(extra_sign*np.arcsin(co/total_coef))
 
-                for j in ind_dict:
-                    if ind_dict[j]=='Y':
-                        self._xvec.gate_(S,j, contract='swap+split')
-                    elif ind_dict[j]=='Z':
-                        self._xvec.gate_(H,j, contract='swap+split')
+            # Apply rotations following [arxiv/1907.09040] for the implementation of a unitary decomposed into several Paulis
+            for i in range(len(params_sort)-2):
+                self.apply_xvec_rot(angles[i]/2,ind_dicts[i],contract=contract) 
+            self.apply_xvec_rot(angles[-1],ind_dicts[-1],contract=contract)
+            for i in range(len(params_sort)-2)[::-1]:
+                self.apply_xvec_rot(angles[i]/2,ind_dicts[i],contract=contract) 
 
-                prev_ind = diff_inds[0]
-                for j in diff_inds[1:rot_ind+1]:
-                    self._xvec.gate_(CNOT, (j,prev_ind), contract='swap+split')
-                    prev_ind = j
-                prev_ind = diff_inds[-1]
-                for j in diff_inds[-2:rot_ind-1:-1]:
-                    self._xvec.gate_(CNOT, (j, prev_ind), contract='swap+split')
-                    prev_ind = i
-
-                self._xvec.gate_(RX(2*angle), (rot_qubit), contract='swap+split')
-
-                prev_ind = rot_qubit
-                for j in diff_inds[rot_ind-1::-1]:
-                    if rot_ind == 0:
-                        continue
-                    self._xvec.gate_(CNOT, (prev_ind,j), contract='swap+split')
-                    prev_ind = i
-                prev_ind = rot_qubit
-                for j in diff_inds[rot_ind+1:]:
-                    self._xvec.gate_(CNOT, (prev_ind,j), contract='swap+split')
-                    prev_ind = i
-
-                for j in ind_dict:
-                    if ind_dict[j]=='Y':
-                        self._xvec.gate_(Sdg,j, contract='swap+split')
-                    elif ind_dict[j]=='Z':
-                        self._xvec.gate_(H,j, contract='swap+split')
-
-                destab_ref = d
-
-            self._xvec.compress(max_bond=self.max_bond)
+            if contract:
+                self._xvec.compress(max_bond=self.max_bond)
 
             if self._debug:
                 print('xvec updated')
@@ -851,14 +909,14 @@ class gen_clifford(Clifford):
                             
         return self._xvec
 
-    def measure(self,observable,tag,qubits=None):
+    def measure(self,observable,tag,qubits=None,project=False):
         # tag is how we will identify the stored result. 
         # If coming from qiskit, one can just use the clbit that was assigned to that measurement
         tableau = self.tableau
         xvec = self._xvec
+        contract = self._contract
 
         num_qubits = len(tableau)//2
-
         if type(observable) is str:
             observable_v = trans_pauli(observable)
         elif len(observable)==len(tableau[0]):
@@ -892,81 +950,87 @@ class gen_clifford(Clifford):
             out1 = (1-ev)/2
             outcome = random()>out0
 
+            if project:
             # Projection
-            phase *= (-1)**outcome # takes into account if the result was 0 or 1
-            angle = np.pi/4
+                print('Projecting state onto measured observable')
+                phase *= (-1)**outcome # takes into account if the result was 0 or 1
+                angle = np.pi/4
 
-            ind_dict = {}
-            Ys = 0    
-            for i,(d,s) in enumerate(zip(destab,stab)):
-                if d:
-                    if s:
-                        ind_dict[i] = 'Y'
-                        Ys += 1
-                    else:
-                        ind_dict[i] = 'X'
-                elif s:
-                    ind_dict[i] = 'Z'
+                ind_dict = {}
+                Ys = 0    
+                for i,(d,s) in enumerate(zip(destab,stab)):
+                    if d:
+                        if s:
+                            ind_dict[i] = 'Y'
+                            Ys += 1
+                        else:
+                            ind_dict[i] = 'X'
+                    elif s:
+                        ind_dict[i] = 'Z'
 
-            diff_inds = [ind for ind in ind_dict]
-            rot_ind = int(len(diff_inds)/2)
-            rot_qubit = diff_inds[rot_ind]
+                diff_inds = [ind for ind in ind_dict]
+                rot_ind = int(len(diff_inds)/2)
+                rot_qubit = diff_inds[rot_ind]
 
-            # basis change
-            for i in ind_dict:
-                if ind_dict[i]=='Y':
-                    new_xvec.gate_(S,i, contract='swap+split')
-                elif ind_dict[i]=='Z':
-                    new_xvec.gate_(H,i, contract='swap+split')
+                # basis change
+                for i in ind_dict:
+                    if ind_dict[i]=='Y':
+                        new_xvec.gate_(S,i, contract=True)
+                    elif ind_dict[i]=='Z':
+                        new_xvec.gate_(H,i, contract=True)
 
-            # CNOTS input
-            prev_ind = diff_inds[0]
-            for i in diff_inds[1:rot_ind+1]:
-                new_xvec.gate_(CNOT, (i,prev_ind), contract='swap+split')
-                prev_ind = i
-            prev_ind = diff_inds[-1]
-            for i in diff_inds[-2:rot_ind-1:-1]:
-                new_xvec.gate_(CNOT, (i, prev_ind), contract='swap+split')
-                prev_ind = i
+                # CNOTS input
+                prev_ind = diff_inds[0]
+                for i in diff_inds[1:rot_ind+1]:
+                    new_xvec.gate_(CNOT, (i,prev_ind), contract=contract)
+                    prev_ind = i
+                prev_ind = diff_inds[-1]
+                for i in diff_inds[-2:rot_ind-1:-1]:
+                    new_xvec.gate_(CNOT, (i, prev_ind), contract=contract)
+                    prev_ind = i
 
-            # Core rotations
-            renorm = 1/np.sqrt(1+np.abs(ev)) 
-            rot_matrix = quimbify([[np.cos(angle)*renorm, phase * (-1)**Ys * np.sin(angle)*renorm],
-                        [phase * (-1)**Ys * np.sin(angle)*renorm, np.cos(angle)*renorm]]) # this is non-unitary!!
-            new_xvec.gate_(rot_matrix, (rot_qubit), contract='swap+split')
+                # Core rotations
+                renorm = 1/np.sqrt(1+np.abs(ev)) 
+                rot_matrix = quimbify([[np.cos(angle)*renorm, phase * (-1)**Ys * np.sin(angle)*renorm],
+                            [phase * (-1)**Ys * np.sin(angle)*renorm, np.cos(angle)*renorm]]) # this is non-unitary!!
+                new_xvec.gate_(rot_matrix, (rot_qubit), contract=True)
 
-            # CNOTS output
-            prev_ind = rot_qubit
-            for i in diff_inds[rot_ind-1::-1]:
-                if rot_ind == 0:
-                    continue
-                new_xvec.gate_(CNOT, (prev_ind,i), contract='swap+split')
-                prev_ind = i
-            prev_ind = rot_qubit
-            for i in diff_inds[rot_ind+1:]:
-                new_xvec.gate_(CNOT, (prev_ind,i), contract='swap+split')
-                prev_ind = i
+                # CNOTS output
+                prev_ind = rot_qubit
+                for i in diff_inds[rot_ind-1::-1]:
+                    if rot_ind == 0:
+                        continue
+                    new_xvec.gate_(CNOT, (prev_ind,i), contract=contract)
+                    prev_ind = i
+                prev_ind = rot_qubit
+                for i in diff_inds[rot_ind+1:]:
+                    new_xvec.gate_(CNOT, (prev_ind,i), contract=contract)
+                    prev_ind = i
 
-            # basis unchange
-            for i in ind_dict:
-                if ind_dict[i]=='Y':
-                    new_xvec.gate_(Sdg,i, contract='swap+split')
-                elif ind_dict[i]=='Z':
-                    new_xvec.gate_(H,i, contract='swap+split')
+                # basis unchange
+                for i in ind_dict:
+                    if ind_dict[i]=='Y':
+                        new_xvec.gate_(Sdg,i, contract=True)
+                    elif ind_dict[i]=='Z':
+                        new_xvec.gate_(H,i, contract=True)
 
-            # remove the entries for which i·k = 1
-            if 1 in destab:
-                k = destab.index(1)
-                new_xvec.gate_(quimbify([[np.sqrt(2),0],[0,0]]), k, contract='swap+split') # this is non-unitary! # it also can be done with a |0> contraction
-                self.tableau = self.meas_tableau(observable_v,destab,stab,(-1)**outcome)
+                # remove the entries for which i·k = 1
+                if 1 in destab:
+                    k = destab.index(1)
+                    new_xvec.gate_(quimbify([[np.sqrt(2),0],[0,0]]), k, contract=True) # this is non-unitary! # it also can be done with a |0> contraction
+                    self.tableau = self.meas_tableau(observable_v,destab,stab,(-1)**outcome)
 
-            # despite the non-unitary matrices, renormalization (which is taken into account) should restore phyisicality, 
-            # which is ensured here:
-            new_xvec.compress(max_bond=self.max_bond)
-            new_xvec = self.normalize()
+                # despite the non-unitary matrices, renormalization (which is taken into account) should restore phyisicality, 
+                # which is ensured here:
+                if self._contract==False:
+                    new_xvec.contract(...,max_bond=self.max_bond)
+                else:
+                    new_xvec.compress(max_bond=self.max_bond)
+                new_xvec = self.normalize()
+                self._xvec = new_xvec
+
             results = {'reg': int(outcome), 'stats':(out0, out1), 'ev':ev} 
             self._results[tag] = results
-            self._xvec = new_xvec
 
             return results
         
@@ -1074,10 +1138,10 @@ class gen_clifford(Clifford):
                 new_xvec = new_xvec_0
                 renorm = renorm_0
 
-            if self.mode in ['sparse','sparse_comp']:
-                _, cols = new_xvec.nonzero()
-            elif self.mode=='dict':
+            if self.mode=='dict':
                 cols = [key for key in new_xvec]
+            elif self.mode in ['sparse','sparse_comp']:
+                _, cols = new_xvec.nonzero()
             for c in cols:
                 new_xvec[inds(c)] *= 1/np.sqrt(renorm)
 
@@ -1160,11 +1224,21 @@ class gen_clifford(Clifford):
                 gate_coefs, destab_list, stab_list = tgate_decomp(self.tableau,qargs[0],dag=True)
                 self.update_xvec(gate_coefs, destab_list, stab_list)
             if name=='ccx':
-                temp = cc_gate(self.num_qubits,qargs[:3],type='x')
-                self._append_gen_circuit(temp)
+                if self.cc_direct:
+                    self._append_h(qargs[2])
+                    gate_coefs, destab_list, stab_list = ccz_decomp(self.tableau,qargs[0:2])
+                    self.update_xvec(gate_coefs, destab_list, stab_list)
+                    self._append_h(qargs[2])
+                else:
+                    temp = cc_gate(self.num_qubits,qargs[:3],type='x')
+                    self._append_gen_circuit(temp)
             if name=='ccz':
-                temp = cc_gate(self.num_qubits,qargs[:3],type='z')
-                self._append_gen_circuit(temp)
+                if self.cc_direct:
+                    gate_coefs, destab_list, stab_list = ccz_decomp(self.tableau,qargs[0:2])
+                    self.update_xvec(gate_coefs, destab_list, stab_list)
+                else:
+                    temp = cc_gate(self.num_qubits,qargs[:3],type='z')
+                    self._append_gen_circuit(temp)
             return
         
         if name in basis_1q:
