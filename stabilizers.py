@@ -504,7 +504,7 @@ def cc_gate(qubits,inds,type='x'):
 class gen_clifford(Clifford):
     # To make it easy we only initialize with clifford circuits so we can keep the init
 
-    def __init__(self, data, copy=True, mode='sparse_comp', max_bond=None, cc_direct=False, contract=False, debug=False, *args, **kwargs):
+    def __init__(self, data, copy=True, mode='tn', max_bond=None, cc_direct=False, contract=True, debug=False, *args, **kwargs):
         super(gen_clifford, self).__init__(data, copy=True, *args, **kwargs)
 
         if isinstance(data, gen_clifford) and copy:
@@ -516,6 +516,7 @@ class gen_clifford(Clifford):
             self._debug = data._debug
             self.cc_direct = data.cc_direct   # Try implementation of cc gate directly
             self._contract = data._contract
+            self._truncations = data.truncations
 
             return 
 
@@ -545,6 +546,7 @@ class gen_clifford(Clifford):
         if contract:
             contract = 'swap+split'
         self._contract = contract
+        self._truncations = []
 
     @property
     def xvec(self):
@@ -565,6 +567,10 @@ class gen_clifford(Clifford):
     @property
     def max_bond(self):
         return self._max_bond
+    
+    @property
+    def truncations(self):
+        return self._truncations
     
     @property
     def tableau_ordered(self):
@@ -651,10 +657,12 @@ class gen_clifford(Clifford):
 
 
     # we need to change the compose method to work with non-cliffords
-    def compose(self,
-        other: QuantumCircuit or Instruction,
-        qargs: list or None = None,
+    def compose(
+        self,
+        other: Clifford | QuantumCircuit | Instruction,
+        qargs: list | None = None,
         front: bool = False,
+        check_svd: bool = False,
     ) -> Clifford:
         if qargs is None:
             qargs = getattr(other, "qargs", None)
@@ -664,9 +672,25 @@ class gen_clifford(Clifford):
         # and then doing the composition of tables.
         if not front:
             if isinstance(other, QuantumCircuit):
-                self._append_gen_circuit(other, qargs=qargs)
+                self._append_gen_circuit(other, qargs=qargs, check_svd=check_svd)
+                return self
             if isinstance(other, Instruction):
-                self._append_gen_operation(other, qargs=qargs)
+                self._append_gen_operation(other, qargs=qargs, check_svd=check_svd)
+                return self    
+        
+        if not isinstance(other, Clifford):
+            other = Clifford(other, copy=False)
+
+        self._op_shape.compose(other._op_shape, qargs, front)
+
+        # Pad other with identities if composing on subsystem
+        other = self._pad_with_identity(other, qargs)
+
+        left, right = (self, other) if front else (other, self)
+
+        if self.num_qubits == 1:
+            self.tableau = self._compose_1q(left, right).tableau
+        self.tableau = self._compose_general(left, right).tableau
 
         return self
 
@@ -717,7 +741,7 @@ class gen_clifford(Clifford):
         self.tableau = tableau
         return tableau
 
-    def normalize(self, insert=-1):
+    def normalize(self, insert=-1, inplace=False):
         # Normalizes a tensor network
         if self.mode != 'tn':
             print("Normalize method was called for non-tn mode")
@@ -726,7 +750,8 @@ class gen_clifford(Clifford):
         tn = self.xvec
         norm = tn.norm()
         tn.tensors[insert].modify(data=tn.tensors[insert].data / norm)
-
+        if inplace:
+            self._xvec = tn
         return tn
 
     def read_tableau_obs(self,destab,stab):
@@ -746,10 +771,11 @@ class gen_clifford(Clifford):
     # for coef,destab,stab in zip(gate_coefs,destab_list,stab_list):
     #     print(f"coeff: {coef}, operator: {self.read_tableau_obs(destab,stab)}")
 
-    def apply_xvec_rot(self,angle,ind_dict,contract=False):
+    def apply_xvec_rot(self,angle,ind_dict,contract=False,check_svd=False):
         # For a given d we need to implement a R[(X/Y/Z)_i] for all qubits i involved in d and s
         # This is done with a cascade of CNOTS, an RX and extra 1qb transf [arxiv/2305.04807]
         if contract: contract='swap+split'
+        renorm = not check_svd
         diff_inds = [ind for ind in ind_dict]
 
         rot_ind = int(len(diff_inds)/2)
@@ -757,52 +783,52 @@ class gen_clifford(Clifford):
 
         for j in ind_dict:
             if ind_dict[j]=='Y':
-                self._xvec.gate_(S,j, contract=True)
+                self._xvec.gate_(S,j, contract=True, renorm=renorm) #, max_bond=self.max_bond)
             elif ind_dict[j]=='Z':
-                self._xvec.gate_(H,j, contract=True)
+                self._xvec.gate_(H,j, contract=True,renorm=renorm)
 
         prev_ind = diff_inds[0]
         for j in diff_inds[1:rot_ind+1]:
-            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract)
+            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract,renorm=renorm)
             prev_ind = j
         prev_ind = diff_inds[-1]
         for j in diff_inds[-2:rot_ind-1:-1]:
-            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract)
+            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract,renorm=renorm)
             prev_ind = j
 
-        self._xvec.gate_(RX(2*angle), (rot_qubit), contract=True)
+        self._xvec.gate_(RX(2*angle), (rot_qubit), contract=True,renorm=renorm)
 
         prev_ind = rot_qubit
         for j in diff_inds[rot_ind-1::-1]:
             if rot_ind == 0:
                 continue
-            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract)
+            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract,renorm=renorm)
             prev_ind = j
         prev_ind = rot_qubit
         for j in diff_inds[rot_ind+1:]:
-            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract)
+            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract,renorm=renorm)
             prev_ind = j
 
         for j in ind_dict:
             if ind_dict[j]=='Y':
-                self._xvec.gate_(Sdg,j, contract=True)
+                self._xvec.gate_(Sdg,j, contract=True,renorm=renorm)
             elif ind_dict[j]=='Z':
-                self._xvec.gate_(H,j, contract=True)
+                self._xvec.gate_(H,j, contract=True,renorm=renorm)
 
 
-    def update_xvec(self,coefs,destab_list,stab_list,tolerance=1e-10):
+    def update_xvec(self,coefs,destab_list,stab_list,tolerance=1e-10,check_svd=False):
         # Main method to update xvec. Different applications depending on the format of the vector
         mode = self.mode
         contract = self._contract
-
+        renorm = not check_svd
         if mode == 'tn':
             params_sort = sorted(zip(coefs,destab_list,stab_list), key=lambda ins: sum(ins[1])) # [ordered array of (coef,destab,stab)]
             destab_ref = params_sort[0][1]
             for i,entry in enumerate(destab_ref):
-                if entry: self._xvec.gate_(X,i,contract=True) # ,contract='swap+split' # apply gates to qubits where the first destabilizer is not 0s
+                if entry: self._xvec.gate_(X,i,contract=True,renorm=renorm) # ,contract='swap+split' # apply gates to qubits where the first destabilizer is not 0s
             stab_ref = params_sort[0][2]
             for i,entry in enumerate(stab_ref):
-                if entry: self._xvec.gate_(Z,i,contract=True) # ,contract='swap+split' # apply gates to qubits where the first stabilizer is not 0s    
+                if entry: self._xvec.gate_(Z,i,contract=True,renorm=renorm) # ,contract='swap+split' # apply gates to qubits where the first stabilizer is not 0s    
             total_coef = params_sort[0][0]
             angles = []
             ind_dicts = []
@@ -845,13 +871,18 @@ class gen_clifford(Clifford):
 
             # Apply rotations following [arxiv/1907.09040] for the implementation of a unitary decomposed into several Paulis
             for i in range(len(params_sort)-2):
-                self.apply_xvec_rot(angles[i]/2,ind_dicts[i],contract=contract) 
-            self.apply_xvec_rot(angles[-1],ind_dicts[-1],contract=contract)
+                self.apply_xvec_rot(angles[i]/2,ind_dicts[i],contract=contract,check_svd=check_svd) 
+            self.apply_xvec_rot(angles[-1],ind_dicts[-1],contract=contract,check_svd=check_svd)
             for i in range(len(params_sort)-2)[::-1]:
-                self.apply_xvec_rot(angles[i]/2,ind_dicts[i],contract=contract) 
+                self.apply_xvec_rot(angles[i]/2,ind_dicts[i],contract=contract,check_svd=check_svd) 
 
             if contract:
-                self._xvec.compress(max_bond=self.max_bond)
+                if check_svd:
+                    self._xvec.compress(max_bond=self.max_bond, renorm=renorm)
+                    self._truncations.append(self._xvec.norm())
+                    self.normalize(inplace=True)
+                else:
+                    self._xvec.compress(max_bond=self.max_bond)
 
             if self._debug:
                 print('xvec updated')
@@ -933,17 +964,18 @@ class gen_clifford(Clifford):
 
         if self.mode == 'tn':
             ev = phase
+            aux_xvec = xvec.copy()
             new_xvec = xvec.copy()
             ref_xvec = xvec.conj()
 
             for qb,val in enumerate(stab):
                 if val:
-                    xvec.gate_(Z,qb)
+                    aux_xvec.gate_(Z,qb)
             for qb,val in enumerate(destab):
                 if val:
-                    xvec.gate_(X,qb)
+                    aux_xvec.gate_(X,qb)
 
-            ev *= ref_xvec @ xvec
+            ev *= ref_xvec @ aux_xvec
             ev = np.round(ev,10)
 
             out0 = (1+ev)/2
@@ -1157,7 +1189,7 @@ class gen_clifford(Clifford):
     ####### Modifying this in the original qiskit should help us #######
     # Right now it's better to initialize with an empty circuit and then 
     # use our "compose" method for all gates (including clifford)
-    def _append_gen_circuit(self, circuit, qargs=None, cargs=None):
+    def _append_gen_circuit(self, circuit, qargs=None, cargs=None, check_svd=False):
         # Copy of _append_circuit with the _apply_gen_operation below instead (see Qiskit documentation)
         if qargs is None:
             qargs = list(range(self.num_qubits))
@@ -1178,14 +1210,14 @@ class gen_clifford(Clifford):
                 continue
             # Get the integer position of the flat register
             new_qubits = [qargs[circuit.find_bit(bit).index] for bit in instruction.qubits]
-            self._append_gen_operation(instruction.operation, new_qubits)
+            self._append_gen_operation(instruction.operation, new_qubits, check_svd=check_svd)
 
         # Sanity check for compression (slows down computation a)
         # if self.mode == 'tn':
         #     self.reduce_bond_dim()
         return
 
-    def _append_gen_operation(self, operation, qargs=None):
+    def _append_gen_operation(self, operation, qargs=None, check_svd=False):
         # Modified _append_operation (see Qiskit documentation) to work with general non-clifford gates
 
         # Basis Clifford Gates
@@ -1219,26 +1251,26 @@ class gen_clifford(Clifford):
         if name in non_clifford:
             if name=='t':   
                 gate_coefs, destab_list, stab_list = tgate_decomp(self.tableau,qargs[0])
-                self.update_xvec(gate_coefs, destab_list, stab_list)
+                self.update_xvec(gate_coefs, destab_list, stab_list, check_svd=check_svd)
             if name=='tdg':
                 gate_coefs, destab_list, stab_list = tgate_decomp(self.tableau,qargs[0],dag=True)
-                self.update_xvec(gate_coefs, destab_list, stab_list)
+                self.update_xvec(gate_coefs, destab_list, stab_list, check_svd=check_svd)
             if name=='ccx':
                 if self.cc_direct:
                     self._append_h(qargs[2])
                     gate_coefs, destab_list, stab_list = ccz_decomp(self.tableau,qargs[0:2])
-                    self.update_xvec(gate_coefs, destab_list, stab_list)
+                    self.update_xvec(gate_coefs, destab_list, stab_list, check_svd=check_svd)
                     self._append_h(qargs[2])
                 else:
                     temp = cc_gate(self.num_qubits,qargs[:3],type='x')
-                    self._append_gen_circuit(temp)
+                    self._append_gen_circuit(temp, check_svd=check_svd)
             if name=='ccz':
                 if self.cc_direct:
                     gate_coefs, destab_list, stab_list = ccz_decomp(self.tableau,qargs[0:2])
-                    self.update_xvec(gate_coefs, destab_list, stab_list)
+                    self.update_xvec(gate_coefs, destab_list, stab_list, check_svd=check_svd)
                 else:
                     temp = cc_gate(self.num_qubits,qargs[:3],type='z')
-                    self._append_gen_circuit(temp)
+                    self._append_gen_circuit(temp, check_svd=check_svd)
             return
         
         if name in basis_1q:
@@ -1313,7 +1345,7 @@ class gen_clifford(Clifford):
                 # This correction to match usual RZ definition is unnecessary computationally
                 # if name=='rz':
                 #     gate_coefs = [t*np.exp(-1j*theta/2) for t in gate_coefs]
-                self.update_xvec(gate_coefs, destab_list, stab_list)
+                self.update_xvec(gate_coefs, destab_list, stab_list, check_svd=check_svd)
                 return 
 
         if isinstance(gate, Clifford):
@@ -1327,7 +1359,7 @@ class gen_clifford(Clifford):
         # If fails, we need to restore the clifford that was before attempting to unroll and append.
         if gate.definition is not None:
             try:
-                self._append_gen_circuit(gate.definition, qargs) 
+                self._append_gen_circuit(gate.definition, qargs, check_svd=check_svd) 
                 return
             except QiskitError:
                 pass
@@ -1338,7 +1370,7 @@ class gen_clifford(Clifford):
             try:
                 matrix = gate.to_matrix()
                 gate_cliff = Clifford.from_matrix(matrix)
-                self._append_gen_operation(gate_cliff, qargs=qargs)
+                self._append_gen_operation(gate_cliff, qargs=qargs, check_svd=check_svd)
                 return
             except TypeError as err:
                 raise QiskitError(f"Cannot apply {gate.name} gate with unbounded parameters") from err
