@@ -5,9 +5,11 @@ from qiskit.quantum_info import Clifford
 from qiskit.quantum_info.operators.symplectic.clifford_circuits import *
 from qiskit.circuit import Barrier, Delay, Gate, Instruction
 from qiskit.circuit.exceptions import CircuitError
-from qiskit.providers.fake_provider import FakeWashingtonV2 # GenericBackendV2(127)
+# from qiskit.providers.fake_provider import FakeWashingtonV2 # GenericBackendV2(127)
 
+import csv
 import numpy as np
+from numpy import complex128
 from random import random
 from scipy.sparse import lil_array #, csr_array, coo_array
 from time import time
@@ -29,6 +31,22 @@ H = qu.hadamard()
 Z = qu.pauli('Z')
 S = qu.S_gate()
 Sdg = qu.S_gate().conj()
+T = qu.T_gate().conj()
+
+################################ Helper circuits from qiskit #####################################
+
+cnot_circ = QuantumCircuit(2)
+cnot_circ.cx(0,1)
+s_circ = QuantumCircuit(1)
+s_circ.s(0)
+sdg_circ = QuantumCircuit(1)
+sdg_circ.sdg(0)
+h_circ = QuantumCircuit(1)
+h_circ.h(0)
+x_circ = QuantumCircuit(1)
+x_circ.x(0)
+z_circ = QuantumCircuit(1)
+z_circ.z(0)
 
 ##################################### Auxiliary functions ########################################
 
@@ -37,7 +55,7 @@ Sdg = qu.S_gate().conj()
 # Boolean clifford basis = entries of a clifford tableau (in boolean pauli form)
 # gen_clifford class = extension of Qiskit's clifford class to non-clifford circuits
 
-
+# Stopped working because most recent qiskit does not have FakeWashingtonV2
 def connectivity_kyiv():
     # Uses fake chip Washington and adds two missing connections to get 
     # the connectivity of the IBM 127qb-chip experiment
@@ -68,7 +86,6 @@ def multiply_bool_pauli(pauli1,pauli2):
     pauli[-1] *= (-1)**(pauli2[-1]) # add the phase of the second pauli
 
     return pauli
-
 
 
 
@@ -206,7 +223,7 @@ def quimb_inital_state(binary_str):
 
 
 
-# This condenses a method used below (which does not use this function because it's more complex)
+# This abstracts a method used below (although it does not use this function because it's more complex)
 def trigonometrize(vector):
     # For an n-dim vector v, finds an n-dim vector t of angles such that the original vector fulfills:
     # v = ( sin(t1)cos(t2), sin(t1)sin(t2)cos(t3), ... , sin(t1)sin(t2)...sin(tn) )
@@ -222,30 +239,7 @@ def trigonometrize(vector):
 
 
 
-
-def check_complexity(gen_clifford,qubits): 
-    # !!!!!!!!!!!!! work in progress !!!!!!!!!!!!!
-    if gen_clifford.mode=='dict':
-        return 0,gen_clifford
-    elif gen_clifford.mode in ['sparse, sparse_comp']:
-        return 0,gen_clifford
-    elif gen_clifford.mode=='tn':
-        old_bond = gen_clifford.xvec.bond_size(qubits[0],qubits[1])
-        new_gen_clifford = gen_clifford.copy()
-        new_gen_clifford.xvec.gate_(CNOT,(qubits[0],qubits[1]),contract='swap+split')
-
-        new_bond = new_gen_clifford.xvec.bond_size(qubits[0],qubits[1])
-        if new_bond > old_bond:
-            return 0,gen_clifford
-        else:
-            return 1,new_gen_clifford
-    
-        # return gen_clifford.xvec.contraction_width(optimize='random-greedy')
-    else: return 0,gen_clifford
-
-
-
-        ########### Translation functions ###########
+################ Translation functions ################
 
 def convert(a,b):
     # Returns the sum of a and b as a binary string. 
@@ -344,7 +338,7 @@ def obs_to_tn(obs,full=False):
         return expec, where
 
 
-        ########## gate decomposition functions #############
+################# gate decomposition functions ###################
 
 
 def gate_decomposition(tableau,gate,qubits=None):
@@ -496,15 +490,121 @@ def cc_gate(qubits,inds,type='x'):
     return temp
 
 
+############### Disentangling functions #################
+
+def min_inner_ind(tn):
+    inds = tn.inner_inds()
+    min_size = 2**len(inds)
+    for ind in inds:
+        new_size = tn.ind_size(ind)
+        if new_size <= min_size:
+            min_size = new_size
+    return min_size
 
 
 
+
+def is_stabilizer(tensor):
+    if tensor.size > 2:
+        # print('This is not a single qubit!')
+        return
+    
+    state = tensor.data
+    # reduce redundant dimensions
+    for i in tensor.shape:
+        if i==1:
+            state = state[0]
+
+    # checks if a 1qb tensor is a stabilizer state
+    if state[0]*np.conj(state[0])-1 < 1e-10:
+        return '0'
+    elif state[1]*np.conj(state[1])-1 < 1e-10:
+        return '1'
+    elif state[0]*np.conj(state[0])-1/np.sqrt(2) < 1e-10:
+        if state[0]-state[1] < 1e-10:
+            return '+'
+        elif state[0]+state[1] < 1e-10:
+            return '-'
+        elif 1j*state[0]-state[1] < 1e-10:
+            return 'r' # |0> + i |1> (going from the first phase to the other follows right hand rule)
+        elif 1j*state[0]+state[1] < 1e-10:
+            return 'l' # |0> - i |1> (going from the first phase to the other follows left hand rule)
+    else:
+        return None
+
+
+
+
+
+def match_basis(Pauli,stab_state):
+    if Pauli in ['X','Y'] and stab_state in ['0','1']:
+        return True
+    elif Pauli in ['Z','Y'] and stab_state in ['+','-']:
+        return True
+    elif Pauli in ['X','Z'] and stab_state in ['r','l']:
+        return True
+    else:
+        return False
+
+
+
+
+def read_matrices(dim,file):
+    mat = np.zeros((2**dim,2**dim),dtype=complex128)
+    with open(file, 'r') as f:
+        reader = csv.reader(f, dialect='excel', delimiter=' ')
+        for row in reader:
+            mat[int(row[1])][int(row[0])] = np.round(float(row[2]),9)+np.round(float(row[3]),9)*1j
+
+    if (np.round(np.matmul(mat.T,mat.conj(),),8) != (np.identity(2**dim,dtype=complex128))).all():
+        print(np.round(np.matmul(mat.T,mat.conj(),),3))
+        print(np.identity(2**dim,dtype=complex128))
+        print('This matrix is not unitary!')
+        
+    return mat
+
+
+
+#### Prepares 2qb and 3qb matrices. ####
+dim = 2
+mat_num = 20  # ideally this is calculated from dim, but I'm unsure about the formula with all the simplifications
+files = [f"{dim}body/{dim}body.dat{i}" for i in range(1,mat_num+1)]
+cliff_2_list = []
+cliff_2_list_qiskit = []
+# mpo_cliff_2_list = []
+for file in files:
+    mat = read_matrices(dim,file)
+    cliff_2_list.append(mat) #.reshape(*[2 for _ in range(2*dim)]))
+    cliff_2_list_qiskit.append(Clifford.from_matrix(mat.conj().T))
+    # mpo_cliff_2_list.append(qtn.tensor_1d.MatrixProductOperator.from_dense(mat.reshape(*[2 for _ in range(2*dim)])))
+
+
+print('To keep the public release lightweight, we did not upload the 3 qubit clifford matrices. If needed, get in contact with the author.')
+########## Do not uncomment the lines below without acquiring the files first !!!!!!!!!! ##########
+# dim = 3
+# mat_num = 6720  # ideally this is calculated from dim, but I'm unsure about the formula with all the simplifications
+# files = [f"{dim}body/{dim}body.dat{i}" for i in range(1,mat_num+1)]
+# cliff_3_list = []
+# cliff_3_list_qiskit = []
+# # mpo_cliff_3_list = []
+# for file in files:
+#     mat = read_matrices(dim,file)
+#     cliff_3_list.append(mat) #.reshape(*[2 for _ in range(2*dim)]))
+#     cliff_3_list_qiskit.append(Clifford.from_matrix(mat.conj().T))
+#     # mpo_cliff_3_list.append(qtn.tensor_1d.MatrixProductOperator.from_dense(mat.reshape(*[2 for _ in range(2*dim)])))
+
+
+###################################################################################################
+###################################################################################################
 ################################# Generalized Clifford class ######################################
+###################################################################################################
+###################################################################################################
+
 
 class gen_clifford(Clifford):
-    # To make it easy we only initialize with clifford circuits so we can keep the init
-
-    def __init__(self, data, copy=True, mode='tn', max_bond=None, cc_direct=False, contract=True, debug=False, *args, **kwargs):
+    # At the moment it's better to initialize without non-clifford gates so we can use Qiskit's original __init__. 
+    # Non-cliffords can be added with the "compose" method.
+    def __init__(self, data, copy=True, mode='tn', max_bond=None, cc_direct=False, contract=True, disentangle='exact', debug=False, *args, **kwargs):
         super(gen_clifford, self).__init__(data, copy=True, *args, **kwargs)
 
         if isinstance(data, gen_clifford) and copy:
@@ -517,6 +617,8 @@ class gen_clifford(Clifford):
             self.cc_direct = data.cc_direct   # Try implementation of cc gate directly
             self._contract = data._contract
             self._truncations = data.truncations
+            self._disentangle = data._disentangle
+            self._disent_flag = data._disent_flag
 
             return 
 
@@ -536,24 +638,27 @@ class gen_clifford(Clifford):
         else:
             raise QiskitError('xvec was not initialized')
         
-        # store mode for the update method
-        self._mode = mode
+        self._mode = mode # store mode for the update method
         self._num_clbits = data.num_qubits
         self._results = {}
         self._max_bond = max_bond # this is useless if mode != 'tn' but it's easier to have the parameter
         self._debug = debug
         self.cc_direct = cc_direct 
-        if contract:
+        if contract==True:
             contract = 'swap+split'
         self._contract = contract
+        self._disentangle = disentangle
         self._truncations = []
+        self._disent_flag = ['0',]*self.num_qubits
 
     @property
     def xvec(self):
+        # Tensor network part of the computation (compatible with MPS so far)
         return self._xvec
 
     @property
     def mode(self):
+        # How to store the information. TN is the most efficient; sparse and dict can be useful for debugging but do not scale well
         return self._mode
 
     @property
@@ -562,15 +667,38 @@ class gen_clifford(Clifford):
 
     @property
     def results(self):
+        # Results of measurements done on the circuit, stored by a string of the obsevable in pauli basis.
         return self._results
     
     @property
     def max_bond(self):
+        # Maximum bond dimension allowed in the TN (xvec) during computation 
         return self._max_bond
     
     @property
     def truncations(self):
+        # Store the truncations done when bond dimension is limited to upper bound fidelity
         return self._truncations
+
+    @property
+    def disentangle(self):
+        # Disentangling method, "exact" by default
+        return self._disentangle
+    
+    @disentangle.setter
+    def disentangle(self, dis_mode):
+        ''' Disentangling method, uses "exact" by default.
+            - Exact: Rearrange the rotation so it doesn't entangle if there's an unused stabilizer state in Xvec. Works up to #n T-gates almost always.
+                    See also: apply_xvec_rotation
+                    Follows: arxiv:2412.17209
+            - Heuristic(3): Sweep Xvec to look for disentangling operations by trying all possible 2(3) clifford entangling gates (Expensive with 2, extremely expensive with 3) 
+                    See also: automatic_disentangle, reduce_entanglement
+                    Follows: arxiv:2407.01692
+            - Exact+heuristic: Use both methods above. Statistically, heuristic does not kick in until after #n T-gates. (Less expensive than Heuristic due to less burden in the first gates)
+        '''
+        if dis_mode not in [False, 'exact', 'heuristic', 'exact+heuristic', 'heuristic3', 'exact+heuristic3']:
+            print("Unknown disentangling method")
+        self._disentangle = dis_mode
     
     @property
     def tableau_ordered(self):
@@ -579,6 +707,7 @@ class gen_clifford(Clifford):
                  for row in self.tableau]
     
     def reduce_bond_dim(self,max_bond=None):
+        # Reduce the bond dimension of Xvec to the specified amount. Also changes internal bond_dim to keep it as specified when adding more gates.
         if max_bond is not None:
             self._max_bond = max_bond
         else:
@@ -594,69 +723,184 @@ class gen_clifford(Clifford):
             
         return
     
+    ####### Disentangling algorithms ########
 
-    def to_pure_mps(self):
-        # This converts to computational basis (traditional MPS) in a sort of optimal way.
-        # to_quimb_circuit uses qiskit's to_circuit to extract a Clifford circuit from the current tableau (optimal in depth)
-        # Then it can apply this circuit on to the MPS in tensor network form by choosing on_mps=True
-        return self.to_quimb_circuit(on_mps=True).contract(...,max_bond=self.max_bond)
+    def _entropy(self, tn, site):
+        # Simplified from quimb to avoid extra calculations. Requires proper handling of gauge as done by the compression in reduce_entanglement
+        Tm1 = tn[site]
+        left_inds = Tm1.bonds(tn[site - 1])
+        
+        S = Tm1.singular_values(left_inds, method='svd') ** 2
+        S = S[S > 0.0]
+        return do("sum", -S * do("log2", S))
+    
+    
+    def reduce_entanglement_eff(self, site, thresh=1e-2):
+        # Streamlined version of reduce_entanglement for the case of dim=2
+        # Performance of disentangling is crucial for large systems as it becomes the bottleneck
+        ref_entropy = self._entropy(self.xvec,site)
+        ref_bond = self._xvec.bond_size(site-1, site)
+        final_entropy = ref_entropy
+        if ref_entropy < thresh:
+            return False
+
+        for i,mat in enumerate(cliff_2_list):
+            new_tn = self.xvec.gate(mat,[site-1, site], contract='auto-mps')
+            new_entropy = self._entropy(new_tn,site)
+            if final_entropy-new_entropy > thresh: 
+                final_entropy = new_entropy
+                output_ind = i
+                if final_entropy < thresh or final_entropy < ref_entropy/2: # Check if we reached trivial entropy
+                    # A local gate could reduce entanglement completely, for example with a SWAP, but this reduction is realistic almost always
+                    self._xvec.gate_(cliff_2_list[output_ind], [site-1, site], contract='auto-mps') #[j for j in range(site, site+dim)]]
+                    self.compose(cliff_2_list_qiskit[output_ind], qargs=[site,site-1], front=True)
+                    return True
+
+        if ref_entropy-final_entropy > thresh:
+            self._xvec.gate_(cliff_2_list[output_ind], [site-1, site], contract='auto-mps') # swap+split
+            self.compose(cliff_2_list_qiskit[output_ind], qargs=[site, site-1], front=True)
+        # We only flag true if we reduced the bond dimension, otherwise we do sweeps with tiny improvements
+        if self._xvec.bond_size(site-1, site)<=ref_bond:
+            return True
+        else:
+            return False
+        
+
+    def reduce_entanglement(self, site, dim=2, thresh=1e-2):
+        # Runs over a list of disentangling 2 or 3 qubit clifford gates to find if any reduce the entropy between a given site and its adjacents
+        if dim==2:
+            return self.reduce_entanglement_eff(site, thresh=thresh) # This is a more efficient version that works only for dim=2
+        elif dim==3:
+            return  # Comment this line and uncommon the two below if you have acquired the 3qb matrices and want to try heuristic3 disentangling
+            # matrices=cliff_3_list
+            # matrices_qisk = cliff_3_list_qiskit
+        else:
+            print('Disentangling with cliffords larger than 3 qubits is not implemented (and is probably not a computationally sound idea)')
+            return
+
+        ref_entropy = [self.xvec.entropy(j) for j in range(site-dim+2,site+1)]
+        final_entropy = ref_entropy
+        if all(np.abs(ref_entropy[j])<thresh for j in range(dim-1)):
+            # This MPS is already separable on this site
+            return False
+
+        for i,mat in enumerate(matrices):
+            new_tn = self.xvec.gate(mat,[j for j in range(site-dim+1, site+1)], contract='auto-mps')
+            new_entropy = [new_tn.entropy(j) for j in range(site-dim+2,site+1)]
+            # if all(new_tn.bond_size(site+j, site+j+1)<=final_tn.bond_size(site+j, site+j+1) for j in range(dim-1)): # checks bond dim
+            if all(final_entropy[j]-new_entropy[j]>thresh for j in range(dim-1)): # checks entropy (+1 is because entropy counts sites, so it starts at 1)
+                final_entropy = new_entropy
+                output_ind = i
+                if all(np.abs(final_entropy[j])<thresh for j in range(dim-1)):
+                    # In this case we disentangled completely
+                    # apply gate on the mps
+                    self._xvec.gate_(matrices[output_ind], [j for j in range(site-dim+1, site+1)], contract='auto-mps') #[j for j in range(site, site+dim)]]
+                    # self._xvec.gate_(matrices[output_ind], [j for j in range(site, site+dim)], contract='auto-mps') #[j for j in range(site, site+dim)]]
+                    # apply conjugate on the Clifford
+                    self.compose(matrices_qisk[output_ind], qargs=[j for j in range(site, site-dim,-1)], front=True)
+                    # self.compose(matrices_qisk[output_ind], qargs=[j for j in range(site+dim-1, site-1,-1)], front=True)
+                    # self.compose(Clifford.from_matrix(matrices_qisk[output_ind].conj().T), qargs=[j for j in range(site+dim-1, site-1,-1)], front=True)
+                    return True
+
+        # if all(final_tn.bond_size(site+j, site+j+1)<=self.xvec.bond_size(site+j, site+j+1) for j in range(dim-1)): # checks bond dim
+        if all(final_entropy[j]<=ref_entropy[j] for j in range(dim-1)) and any(ref_entropy[j]-final_entropy[j]>thresh for j in range(dim-1)):
+            # In this case we only disentangled partially
+            self._xvec.gate_(matrices[output_ind], [j for j in range(site-dim+1, site+1)], contract='auto-mps') # swap+split
+            self.compose(matrices_qisk[output_ind], qargs=[j for j in range(site, site-dim,-1)], front=True)
+            return True
+        else:
+            return False
 
 
-    def computational_basis(self,tol=1e-10j):
-        # this is brute force, there might be a better way to do it!
-        qubits = self.num_qubits
-        comp_vec = np.zeros(2**qubits,dtype=complex)
-        format_s = '{'+f":0>{qubits}b"+'}'
-        stab_ket = self.to_quimb_circuit()
+    def automatic_disentangle(self,max_sweeps=3,dim_cliffords=2,thresh=1e-2):
+        # Disentangles the TN with brute force by trying all possible 2/3-local cliffords in a sweep-manner, following [arXiv:2407.01692]
+        sweep_flag = False # Check if there were no changes to entanglement in a sweep for an early stop
+        # global_flag = False
+        n = self.xvec.L
+        # ref = sum([self.xvec.entropy(site+1) for site in range(n-1)])/n
 
-        for i in range(2**qubits):
-            # bra_qc = quimb_inital_state(format_s.format(i))
-            bra = qu.tensor.tensor_builder.MPS_computational_state(format_s.format(i))
-            # print(bra.H @ stab_ket.psi)
-            res = 0j
-            print(f"checking state {format_s.format(i)}")
-            for j in range(2**qubits):
-                coef = self.xvec.contract().data[*[int(ch) for ch in format_s.format(j)]] 
-                if np.abs(coef)<tol: 
-                    continue
-                op = [0,]*(2*qubits)+[1]
-                # print(j)
-                print(format_s.format(j))
-                for k in range(qubits):
-                    if format_s.format(j)[k] == '1':
-                        op = multiply_bool_pauli(op,self.tableau[k])
-                phase = op[-1]
-                trans_op = trans_pauli_rev(op)
-                print(phase_convert(phase)+' '+trans_op)
-                expec, where = obs_to_tn(trans_op)
-                val = phase * expect_tn(bra,expec,stab_ket,where)
-                res += coef * val if np.abs(coef*val) > tol else 0
-                print(f"coefficient:{coef}")
-                print(f"expected value: {val}")
-                print(f"added value: {coef * val}")
-                print(f"current res: {res}")
-            if i==0:
-                glob_phase = np.conj(res)/np.sqrt(res*np.conj(res))
+        for _ in range(max_sweeps):
+            for j in range(dim_cliffords-1,self.xvec.L):
+                self.xvec.compress(j)
+                flag = self.reduce_entanglement(j,dim=dim_cliffords,thresh=n*thresh)
+                if flag: sweep_flag = True
 
-            comp_vec[i] = glob_phase*res
+            if not sweep_flag: # check on the way forward
+                break
+            else:
+                # global_flag = True
+                sweep_flag = False
 
-        return comp_vec.reshape([2,]*qubits)
+            for j in range(self.xvec.L-1,dim_cliffords-2,-1):
+                self.xvec.compress(j)
+                flag = self.reduce_entanglement(j,dim=dim_cliffords,thresh=n*thresh)
+                if flag: sweep_flag = True
+
+            if not sweep_flag: # and again on the way back
+                break
+            else:
+                # global_flag = True
+                sweep_flag = False
+
+        # print(f"It's {global_flag} that we disentangled")
+        # if global_flag:
+        #     print(f"We went from an average of {ref} to {sum([self.xvec.entropy(site+1) for site in range(n-1)])/n} entropy")
+        return self
+
+
+    def heur_disentangle(function):
+        # Wrapper to apply the disentangling procedure on methods of the class that apply a transformation
+        def wrapper(self,*args, **kw):
+            output = function(self,*args, **kw)
+            if self.disentangle in ['heuristic','exact+heuristic']:
+                self.automatic_disentangle()
+            elif self.disentangle in ['heuristic3', 'exact+heuristic3']:
+                print('The heuristic3 method does not work without the data for 3-qubit clifford matrices (and is very expensive).') 
+                # self.automatic_disentangle(dim_cliffords=3)            # If uncommented, see also line 583 and 774
+            return output
+        return wrapper
+    
     
 
-    def to_quimb_circuit(self,on_mps=False):
+    ###### Conversion algorithms #######
+
+
+    def to_quimb_circuit(self,on_mps=False,contract='swap+split'):
+        # Returns Clifford tableau as a TN circuit, applied over the TN if on_mps = True and over the computational 0 state otherwise
         if on_mps:
             quimb_c = qu.tensor.Circuit(self.num_qubits,self.xvec)
         else:
             quimb_c = qu.tensor.Circuit(self.num_qubits)
         qiskit_c = self.to_circuit()
         for gt in qiskit_c:
-            quimb_c.apply_gate(gt.operation.name, *[qiskit_c.find_bit(qb).index for qb in gt.qubits])
+            quimb_c.apply_gate(gt.operation.name, *[qiskit_c.find_bit(qb).index for qb in gt.qubits], contract=contract)
+            # quimb_c.gate_(gt.operation.name, *[qiskit_c.find_bit(qb).index for qb in gt.qubits], contract=True)
 
         return quimb_c
+
+
+
+
+    def compress_clifford(self, inplace=False):
+        # This converts to computational basis (traditional MPS) in a sort of optimal way.
+        # to_quimb_circuit uses qiskit's to_circuit to extract a Clifford circuit from the current tableau (optimal in depth)
+        # By choosing in_place=True it applies such circuit on to the MPS in tensor network form and resets the clifford tableau.
+        # Otherwise it returns the equivalent tensor from contracting the TN and the Clifford but leaves the object as it was
+        if inplace:
+            self._xvec = self.to_quimb_circuit(on_mps=True).psi #.contract(...,max_bond=self.max_bond)
+            self.tableau = Clifford.from_circuit(QuantumCircuit(self.num_qubits)).tableau
+            return self
+        else:
+            return self.to_quimb_circuit(on_mps=True).psi #.contract(...,max_bond=self.max_bond)
+
+
     
 
+    ###### TN/Clifford updating functions #######
 
-    # we need to change the compose method to work with non-cliffords
+
+    # Main method for simulations. This is an iteration on Qiskit's compose method that works with non-cliffords
+    # Classifies automatically which method to run based on the format of the input circuit/operation/Instruction
     def compose(
         self,
         other: Clifford | QuantumCircuit | Instruction,
@@ -677,7 +921,7 @@ class gen_clifford(Clifford):
             if isinstance(other, Instruction):
                 self._append_gen_operation(other, qargs=qargs, check_svd=check_svd)
                 return self    
-        
+         
         if not isinstance(other, Clifford):
             other = Clifford(other, copy=False)
 
@@ -754,6 +998,7 @@ class gen_clifford(Clifford):
             self._xvec = tn
         return tn
 
+
     def read_tableau_obs(self,destab,stab):
         # Returns the Pauli operator corresponding to an observable (obs) given 
         # in tableau form, using the current destabilizer basis.
@@ -765,59 +1010,130 @@ class gen_clifford(Clifford):
         phase = pauli_form[-1]
 
         return phase, trans_pauli_rev(pauli_form)
-
     # "read_tableau_obs" can be used like this
     # print(f"coefficients from ugate decomp:")
     # for coef,destab,stab in zip(gate_coefs,destab_list,stab_list):
     #     print(f"coeff: {coef}, operator: {self.read_tableau_obs(destab,stab)}")
 
-    def apply_xvec_rot(self,angle,ind_dict,contract=False,check_svd=False):
+
+
+    def apply_xvec_rot(self,angle,ind_dict,contract=None,check_svd=False):
+        # Main part of the TN transformation. Used by update_xvec
         # For a given d we need to implement a R[(X/Y/Z)_i] for all qubits i involved in d and s
-        # This is done with a cascade of CNOTS, an RX and extra 1qb transf [arxiv/2305.04807]
-        if contract: contract='swap+split'
+        # This is done with a cascade of CNOTS, one RX and 1qb basis changes [arxiv/2305.04807]
+        # It also applies a generalization of the idea in [arXiv:2412.17209] to minimize the generation of entanglement
+        if contract==None: 
+            contract = self._contract
         renorm = not check_svd
         diff_inds = [ind for ind in ind_dict]
 
-        rot_ind = int(len(diff_inds)/2)
-        rot_qubit = diff_inds[rot_ind]
+        rot_qubit = None 
+        disentangable = False
+        flip_flag = False
+        if self._disentangle in ['exact','exact+heuristic','exact+heuristic3']:
+            for i,ind in enumerate(diff_inds):
+                if self._disent_flag[ind] and match_basis(ind_dict[ind],self._disent_flag[ind]):
+                    rot_ind = i
+                    rot_qubit = ind
+                    if self._disent_flag[ind]== '1':
+                        flip_flag = x_circ
+                        flip_gate = X
+                    elif self._disent_flag[ind] in ['-','l']:
+                        flip_flag = z_circ
+                        flip_gate = Z
+                    self._disent_flag[ind] = False
+                    disentangable = True
+                    break
+        # if disentangable: 
+        #     print('Disentangling this gate completely')
+        #     if len(diff_inds)==1:
+        #         print('Although it was not going to entangle anyway')
+                
+        if rot_qubit == None:
+            rot_ind = int(len(diff_inds)/2)
+            rot_qubit = diff_inds[rot_ind]
 
-        for j in ind_dict:
-            if ind_dict[j]=='Y':
-                self._xvec.gate_(S,j, contract=True, renorm=renorm) #, max_bond=self.max_bond)
-            elif ind_dict[j]=='Z':
-                self._xvec.gate_(H,j, contract=True,renorm=renorm)
+        if not disentangable:
+            for j in ind_dict:
+                if ind_dict[j]=='Y':
+                    self._xvec.gate_(S,j, contract=True, renorm=renorm)
+                elif ind_dict[j]=='Z':
+                    self._xvec.gate_(H,j, contract=True, renorm=renorm)
 
-        prev_ind = diff_inds[0]
-        for j in diff_inds[1:rot_ind+1]:
-            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract,renorm=renorm)
-            prev_ind = j
-        prev_ind = diff_inds[-1]
-        for j in diff_inds[-2:rot_ind-1:-1]:
-            self._xvec.gate_(CNOT, (j, prev_ind), contract=contract,renorm=renorm)
-            prev_ind = j
+            prev_ind = diff_inds[0]
+            for j in diff_inds[1:rot_ind+1]:
+                self._xvec.gate_(CNOT, (j, prev_ind), contract=contract, renorm=renorm)
+                prev_ind = j
+            prev_ind = diff_inds[-1]
+            for j in diff_inds[-2:rot_ind-1:-1]:
+                self._xvec.gate_(CNOT, (j, prev_ind), contract=contract, renorm=renorm)
+                prev_ind = j
+            # Alternatively we can avoid the cnot cascade and apply directly
+            # for j in diff_inds[:rot_ind]:
+            #     self._xvec.gate_(CNOT, (rot_qubit,j), contract=contract, renorm=renorm)
+            # for j in diff_inds[rot_ind+1:]:
+            #     self._xvec.gate_(CNOT, (rot_qubit,j), contract=contract, renorm=renorm)
+        else:
+            if flip_flag:
+                self._xvec.gate_(flip_gate, rot_qubit, contract=contract, renorm=renorm)
+            if ind_dict[rot_qubit]=='Y':
+                self._xvec.gate_(S, rot_qubit, contract=contract, renorm=renorm)
+            elif ind_dict[rot_qubit]=='Z':
+                self._xvec.gate_(H, rot_qubit, contract=contract, renorm=renorm)
 
-        self._xvec.gate_(RX(2*angle), (rot_qubit), contract=True,renorm=renorm)
+        self._xvec.gate_(RX(2*angle), (rot_qubit), contract=True, renorm=renorm)
 
-        prev_ind = rot_qubit
-        for j in diff_inds[rot_ind-1::-1]:
-            if rot_ind == 0:
-                continue
-            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract,renorm=renorm)
-            prev_ind = j
-        prev_ind = rot_qubit
-        for j in diff_inds[rot_ind+1:]:
-            self._xvec.gate_(CNOT, (prev_ind,j), contract=contract,renorm=renorm)
-            prev_ind = j
+        if not disentangable: 
+            # Since these are clifford gates, we can place them in the tableau instead of the TN 
+            # Although this is not always a decrease in entanglement, it is most of the time, so the average load on the heuristic disentangler is reduced
+            prev_ind = rot_qubit
+            for j in diff_inds[rot_ind-1::-1]:
+                if rot_ind == 0:
+                    continue
+                # self._xvec.gate_(CNOT, (prev_ind,j), contract=contract, renorm=renorm)
+                self.compose(Clifford(cnot_circ), qargs=[prev_ind,j], front=True)
+                prev_ind = j
+            prev_ind = rot_qubit
+            for j in diff_inds[rot_ind+1:]:
+                # self._xvec.gate_(CNOT, (prev_ind,j), contract=contract, renorm=renorm)
+                self.compose(Clifford(cnot_circ), qargs=[prev_ind,j], front=True)
+                prev_ind = j
 
-        for j in ind_dict:
-            if ind_dict[j]=='Y':
-                self._xvec.gate_(Sdg,j, contract=True,renorm=renorm)
-            elif ind_dict[j]=='Z':
-                self._xvec.gate_(H,j, contract=True,renorm=renorm)
+            for j in ind_dict:
+                if ind_dict[j]=='Y':
+                    # self._xvec.gate_(Sdg,j, contract=True, renorm=renorm)
+                    self.compose(Clifford(sdg_circ), qargs=[j], front=True)
+                elif ind_dict[j]=='Z':
+                    # self._xvec.gate_(H,j, contract=True, renorm=renorm)
+                    self.compose(Clifford(h_circ), qargs=[j], front=True)
+        else:
+            for j in ind_dict:
+                if ind_dict[j]=='Y':
+                    self.compose(Clifford(sdg_circ), qargs=[j], front=True)
+                elif ind_dict[j]=='Z':
+                    self.compose(Clifford(h_circ), qargs=[j], front=True)   
+
+            # For Cliffords it's more straightforward to do it like this (and does not cost more)
+            for j in diff_inds[:rot_ind]:
+                self.compose(Clifford(cnot_circ), qargs=[rot_qubit,j], front=True)
+            for j in diff_inds[rot_ind+1:]:
+                self.compose(Clifford(cnot_circ), qargs=[rot_qubit,j], front=True)
+                # self.compose(Clifford.from_matrix(CNOT), qargs=[j,rot_qubit], front=True) # If using the "from_matrix" approach, qubit order is flipped!!!! ( I spent hours here )
+
+            for j in ind_dict:
+                if j == rot_qubit:
+                    continue
+                if ind_dict[j]=='Y':
+                    self.compose(Clifford(s_circ), qargs=[j], front=True)
+                elif ind_dict[j]=='Z':
+                    self.compose(Clifford(h_circ), qargs=[j], front=True)
+            if flip_flag:
+                self.compose(Clifford(flip_flag), qargs=[rot_qubit], front=True)
+            
 
 
     def update_xvec(self,coefs,destab_list,stab_list,tolerance=1e-10,check_svd=False):
-        # Main method to update xvec. Different applications depending on the format of the vector
+        # Main method to update xvec. Different applications depending on the format of the vector. The most efficient and useful is 'tn'
         mode = self.mode
         contract = self._contract
         renorm = not check_svd
@@ -940,7 +1256,7 @@ class gen_clifford(Clifford):
                             
         return self._xvec
 
-    def measure(self,observable,tag,qubits=None,project=False):
+    def measure(self,observable,tag=None,qubits=None,project=False):
         # tag is how we will identify the stored result. 
         # If coming from qiskit, one can just use the clbit that was assigned to that measurement
         tableau = self.tableau
@@ -950,11 +1266,16 @@ class gen_clifford(Clifford):
         num_qubits = len(tableau)//2
         if type(observable) is str:
             observable_v = trans_pauli(observable)
+            observable_str = observable
         elif len(observable)==len(tableau[0]):
             observable_v = observable
+            observable_str = trans_pauli_rev(observable)
         else:
             print("Did not recognize format of observable to measure")
             return {}
+
+        if tag==None:
+            tag = observable_str + '_' + str(len(self.results))
         
         if qubits is not None:
             try: len(qubits)>1
@@ -976,7 +1297,7 @@ class gen_clifford(Clifford):
                     aux_xvec.gate_(X,qb)
 
             ev *= ref_xvec @ aux_xvec
-            ev = np.round(ev,10)
+            # ev = np.round(ev,10)
 
             out0 = (1+ev)/2
             out1 = (1-ev)/2
@@ -1186,7 +1507,7 @@ class gen_clifford(Clifford):
         return results
 
 
-    ####### Modifying this in the original qiskit should help us #######
+    ###### Modifying this in the original qiskit would be better #######
     # Right now it's better to initialize with an empty circuit and then 
     # use our "compose" method for all gates (including clifford)
     def _append_gen_circuit(self, circuit, qargs=None, cargs=None, check_svd=False):
@@ -1196,7 +1517,6 @@ class gen_clifford(Clifford):
         if cargs is None:
             cargs = list(range(self.num_clbits))
         for instruction in circuit:
-            # start = time()
             if instruction.clbits and instruction.operation.name!='measure':
                 raise QiskitError(
                     f"Cannot apply Instruction with classical bits: {instruction.operation.name}"
@@ -1212,11 +1532,10 @@ class gen_clifford(Clifford):
             new_qubits = [qargs[circuit.find_bit(bit).index] for bit in instruction.qubits]
             self._append_gen_operation(instruction.operation, new_qubits, check_svd=check_svd)
 
-        # Sanity check for compression (slows down computation a)
-        # if self.mode == 'tn':
-        #     self.reduce_bond_dim()
+
         return
 
+    @heur_disentangle
     def _append_gen_operation(self, operation, qargs=None, check_svd=False):
         # Modified _append_operation (see Qiskit documentation) to work with general non-clifford gates
 
@@ -1281,10 +1600,6 @@ class gen_clifford(Clifford):
         if name in basis_2q:
             if len(qargs) != 2:
                 raise QiskitError("Invalid qubits for 2-qubit gate.")
-            # if name=='cx': ########################################################## work in progress
-            #     cheaper, new_gen_clifford = check_complexity(gen_clifford,qargs)
-            #     if cheaper:
-            #         return new_gen_clifford
             basis_2q[name](qargs[0], qargs[1])
             return
 
@@ -1494,15 +1809,4 @@ class gen_clifford(Clifford):
         self.z[:, [qubit0, qubit1]] = self.z[:, [qubit1, qubit0]]
         return 
         
-
-    ######### Work in progress ##########
-    # def reduce_distance(self,override=False): # this method is only a performance boost for TN mode
         
-    #     # Checks current tableau to see if there is a simplification that makes pauli matrices X,Y,Z 
-    #     # more local in terms of index i weight (how many entries are different)
-
-    #     self.tableau
-    #     # should be ran after every update for general simplifications (i.e. guaranteed to improve) and also
-    #     # after knowing which qubit to apply a specific transformation (i.e. better for some but worse for others)
-
-    #     return self.tableau
