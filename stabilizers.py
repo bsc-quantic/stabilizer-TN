@@ -9,6 +9,7 @@ from qiskit.circuit.exceptions import CircuitError
 
 import csv
 import numpy as np
+import math
 from numpy import complex128
 from random import random
 from scipy.sparse import lil_array #, csr_array, coo_array
@@ -467,18 +468,18 @@ def cc_gate(qubits,inds,type='x'):
     elif type != 'z':
         raise CircuitError('cc_gate type not implemented')
     
-    temp.cnot(inds[1],inds[2])
+    temp.cx(inds[1],inds[2])
     temp.tdg(inds[2])
-    temp.cnot(inds[0],inds[2])
+    temp.cx(inds[0],inds[2])
     temp.t(inds[2])
-    temp.cnot(inds[1],inds[2])
+    temp.cx(inds[1],inds[2])
     temp.tdg(inds[2])
-    temp.cnot(inds[0],inds[2])
+    temp.cx(inds[0],inds[2])
     temp.t([inds[1],inds[2]])
-    temp.cnot(inds[0],inds[1])
+    temp.cx(inds[0],inds[1])
     temp.t(inds[0])
     temp.tdg(inds[1])
-    temp.cnot(inds[0],inds[1])
+    temp.cx(inds[0],inds[1])
 
     if type == 'x':
         temp.h(inds[2])
@@ -566,6 +567,8 @@ def read_matrices(dim,file):
 
 
 #### Prepares 2qb and 3qb matrices. ####
+# It takes time, so consider moving it to single execution conditioned on initializing at least one stabTN!
+
 dim = 2
 mat_num = 20  # ideally this is calculated from dim, but I'm unsure about the formula with all the simplifications
 files = [f"{dim}body/{dim}body.dat{i}" for i in range(1,mat_num+1)]
@@ -577,7 +580,6 @@ for file in files:
     cliff_2_list.append(mat) #.reshape(*[2 for _ in range(2*dim)]))
     cliff_2_list_qiskit.append(Clifford.from_matrix(mat.conj().T))
     # mpo_cliff_2_list.append(qtn.tensor_1d.MatrixProductOperator.from_dense(mat.reshape(*[2 for _ in range(2*dim)])))
-
 
 print('To keep the public release lightweight, we did not upload the 3 qubit clifford matrices. If needed, get in contact with the author.')
 ########## Do not uncomment the lines below without acquiring the files first !!!!!!!!!! ##########
@@ -604,7 +606,7 @@ print('To keep the public release lightweight, we did not upload the 3 qubit cli
 class gen_clifford(Clifford):
     # At the moment it's better to initialize without non-clifford gates so we can use Qiskit's original __init__. 
     # Non-cliffords can be added with the "compose" method.
-    def __init__(self, data, copy=True, mode='tn', max_bond=None, cc_direct=False, contract=True, disentangle='exact', debug=False, *args, **kwargs):
+    def __init__(self, data, tensor_in=None, copy=True, mode='tn', max_bond=None, cc_direct=False, contract=True, disentangle='exact', max_sweeps=2, debug=False, *args, **kwargs):
         super(gen_clifford, self).__init__(data, copy=True, *args, **kwargs)
 
         if isinstance(data, gen_clifford) and copy:
@@ -624,8 +626,23 @@ class gen_clifford(Clifford):
 
         # initalize bond_matrix if it's not a copy
         if mode=='tn':
-            psi0 = qtn.MPS_computational_state('0' * self.num_qubits)
-            self._xvec = psi0
+            if tensor_in is not None:
+                if isinstance(tensor_in,np.ndarray):
+                    psi_init = tensor_in
+                elif isinstance(tensor_in,(qu.tensor.tensor_core.Tensor)):
+                    psi_init = tensor_in.data
+                elif isinstance(tensor_in,(qu.tensor.tensor_core.TensorNetwork,qu.tensor.tensor_core.Tensor)):
+                    # A more efficient translation can be coded, but then it is not universal for arbitrary structures
+                    psi_init = tensor_in.contract(...).data
+                total_dim = math.prod(np.shape(psi_init))
+                dims = [2,]*int(np.log2(total_dim))
+                if math.prod(dims) != total_dim:
+                    raise TypeError('Input state cannot be arranged into qubits')
+                else:
+                    self._xvec = qtn.MatrixProductState.from_dense(psi_init, dims)
+            else:
+                psi0 = qtn.MPS_computational_state('0' * self.num_qubits)
+                self._xvec = psi0
         elif mode=='dict':
             self._xvec = {np.array([0])[0]: 1}
         elif mode in ['sparse','sparse_comp']:
@@ -647,7 +664,8 @@ class gen_clifford(Clifford):
         if contract==True:
             contract = 'swap+split'
         self._contract = contract
-        self._disentangle = disentangle
+        self._disentangle = disentangle 
+        self._max_sweeps = max_sweeps
         self._truncations = []
         self._disent_flag = ['0',]*self.num_qubits
 
@@ -699,6 +717,11 @@ class gen_clifford(Clifford):
         if dis_mode not in [False, 'exact', 'heuristic', 'exact+heuristic', 'heuristic3', 'exact+heuristic3']:
             print("Unknown disentangling method")
         self._disentangle = dis_mode
+
+    @property
+    def max_sweeps(self):
+        # Depth of the disentangling heuristic (if used)
+        return self._max_sweeps
     
     @property
     def tableau_ordered(self):
@@ -766,12 +789,13 @@ class gen_clifford(Clifford):
             return False
         
 
-    def reduce_entanglement(self, site, dim=2, thresh=1e-2):
+    def reduce_entanglement(self, site, dim=2, thresh=1e-5, forward=True):
         # Runs over a list of disentangling 2 or 3 qubit clifford gates to find if any reduce the entropy between a given site and its adjacents
         if dim==2:
             return self.reduce_entanglement_eff(site, thresh=thresh) # This is a more efficient version that works only for dim=2
         elif dim==3:
-            return  # Comment this line and uncommon the two below if you have acquired the 3qb matrices and want to try heuristic3 disentangling
+            print('Disentangling with cliffords of 3 qubits is disabled in the code')
+            return # Comment this line and uncommon the two below if you have acquired the 3qb matrices and want to try heuristic3 disentangling
             # matrices=cliff_3_list
             # matrices_qisk = cliff_3_list_qiskit
         else:
@@ -788,7 +812,8 @@ class gen_clifford(Clifford):
             new_tn = self.xvec.gate(mat,[j for j in range(site-dim+1, site+1)], contract='auto-mps')
             new_entropy = [new_tn.entropy(j) for j in range(site-dim+2,site+1)]
             # if all(new_tn.bond_size(site+j, site+j+1)<=final_tn.bond_size(site+j, site+j+1) for j in range(dim-1)): # checks bond dim
-            if all(final_entropy[j]-new_entropy[j]>thresh for j in range(dim-1)): # checks entropy (+1 is because entropy counts sites, so it starts at 1)
+            # if all(final_entropy[j]-new_entropy[j]>thresh for j in range(dim-1)): # checks entropy (+1 is because entropy counts sites, so it starts at 1) # This was used until Feb 26
+            if (forward and (final_entropy[0]-new_entropy[0])>thresh) or ((not forward) and (final_entropy[dim-2]-new_entropy[dim-2])>thresh): # This one checks the edge sites
                 final_entropy = new_entropy
                 output_ind = i
                 if all(np.abs(final_entropy[j])<thresh for j in range(dim-1)):
@@ -812,10 +837,14 @@ class gen_clifford(Clifford):
             return False
 
 
-    def automatic_disentangle(self,max_sweeps=3,dim_cliffords=2,thresh=1e-2):
+    def automatic_disentangle(self,max_sweeps=2,dim_cliffords=2,thresh=1e-2):
         # Disentangles the TN with brute force by trying all possible 2/3-local cliffords in a sweep-manner, following [arXiv:2407.01692]
         sweep_flag = False # Check if there were no changes to entanglement in a sweep for an early stop
-        # global_flag = False
+        if self.max_sweeps is not None:
+            max_sweeps = self.max_sweeps
+        else:
+            print('used default sweeps')
+
         n = self.xvec.L
         # ref = sum([self.xvec.entropy(site+1) for site in range(n-1)])/n
 
@@ -833,7 +862,7 @@ class gen_clifford(Clifford):
 
             for j in range(self.xvec.L-1,dim_cliffords-2,-1):
                 self.xvec.compress(j)
-                flag = self.reduce_entanglement(j,dim=dim_cliffords,thresh=n*thresh)
+                flag = self.reduce_entanglement(j,dim=dim_cliffords,thresh=n*thresh,forward=False)
                 if flag: sweep_flag = True
 
             if not sweep_flag: # and again on the way back
@@ -856,7 +885,7 @@ class gen_clifford(Clifford):
                 self.automatic_disentangle()
             elif self.disentangle in ['heuristic3', 'exact+heuristic3']:
                 print('The heuristic3 method does not work without the data for 3-qubit clifford matrices (and is very expensive).') 
-                # self.automatic_disentangle(dim_cliffords=3)            # If uncommented, see also line 583 and 774
+                # self.automatic_disentangle(dim_cliffords=3)            # If uncommented, see also line 584 and 798
             return output
         return wrapper
     
@@ -892,7 +921,6 @@ class gen_clifford(Clifford):
             return self
         else:
             return self.to_quimb_circuit(on_mps=True).psi #.contract(...,max_bond=self.max_bond)
-
 
     
 
@@ -1090,22 +1118,22 @@ class gen_clifford(Clifford):
             for j in diff_inds[rot_ind-1::-1]:
                 if rot_ind == 0:
                     continue
-                # self._xvec.gate_(CNOT, (prev_ind,j), contract=contract, renorm=renorm)
-                self.compose(Clifford(cnot_circ), qargs=[prev_ind,j], front=True)
+                self._xvec.gate_(CNOT, (prev_ind,j), contract=contract, renorm=renorm)
+                # self.compose(Clifford(cnot_circ), qargs=[prev_ind,j], front=True)
                 prev_ind = j
             prev_ind = rot_qubit
             for j in diff_inds[rot_ind+1:]:
-                # self._xvec.gate_(CNOT, (prev_ind,j), contract=contract, renorm=renorm)
-                self.compose(Clifford(cnot_circ), qargs=[prev_ind,j], front=True)
+                self._xvec.gate_(CNOT, (prev_ind,j), contract=contract, renorm=renorm)
+                # self.compose(Clifford(cnot_circ), qargs=[prev_ind,j], front=True)
                 prev_ind = j
 
             for j in ind_dict:
                 if ind_dict[j]=='Y':
-                    # self._xvec.gate_(Sdg,j, contract=True, renorm=renorm)
-                    self.compose(Clifford(sdg_circ), qargs=[j], front=True)
+                    self._xvec.gate_(Sdg,j, contract=True, renorm=renorm)
+                    # self.compose(Clifford(sdg_circ), qargs=[j], front=True)
                 elif ind_dict[j]=='Z':
-                    # self._xvec.gate_(H,j, contract=True, renorm=renorm)
-                    self.compose(Clifford(h_circ), qargs=[j], front=True)
+                    self._xvec.gate_(H,j, contract=True, renorm=renorm)
+                    # self.compose(Clifford(h_circ), qargs=[j], front=True)
         else:
             for j in ind_dict:
                 if ind_dict[j]=='Y':
@@ -1297,7 +1325,7 @@ class gen_clifford(Clifford):
                     aux_xvec.gate_(X,qb)
 
             ev *= ref_xvec @ aux_xvec
-            # ev = np.round(ev,10)
+            ev = np.round(ev,10)
 
             out0 = (1+ev)/2
             out1 = (1-ev)/2
