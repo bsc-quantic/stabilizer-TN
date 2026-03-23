@@ -11,3 +11,5 @@ It stores the vector of complex coefficients for a quantum state in MPS form, us
 We are able to disentangle further the MPS with a generalization of the exact method in arxiv:2412.17209 and an implementation of the sweeping disentangling in arxiv:2407.01692.
 
 The stabilizers.ipynb file is an example in notebook format on its utilization, as well as the code lines to produce the figure in the main text of https://arxiv.org/abs/2403.08724, which illustrates how to do use the class methods to achieve the procedures above.
+
+The folder "disentangling experiments" includes the data and notebooks used to produce figures in arXiv:2602.15942, where the disentangling methods mentione above are studied in depth.
